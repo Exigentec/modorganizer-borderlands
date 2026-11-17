@@ -14,12 +14,17 @@ LOG: list[tuple[str, str]] = []  # (level, message) sent through qInfo/qWarning/
 DIALOGS: list[tuple] = []        # (kind, title, text) for every Qt dialog the plugin showed
 PROMPTS: list = []               # the QMessageBox instances that were exec()'d
 CURSOR: list[str] = []           # "set" / "restore" calls on the override cursor
-UI = {"confirm": "Yes", "prompt": "ok", "item": 0}  # scripted answers
+PROGRESS: list = []              # the progress dialogs that were opened
+APP_DIR = ["C:/fake/MO2"]        # what QCoreApplication.applicationDirPath() says
+QUIT: list[int] = []             # QApplication.quit() calls
+UI = {"confirm": "Yes", "prompt": "ok", "item": 0, "choices": []}  # scripted answers
 
 
 def reset_ui():
-    DIALOGS.clear(), PROMPTS.clear(), CURSOR.clear()
-    UI.update({"confirm": "Yes", "prompt": "ok", "item": 0})
+    DIALOGS.clear(), PROMPTS.clear(), CURSOR.clear(), PROGRESS.clear()
+    UI.update({"confirm": "Yes", "prompt": "ok", "item": 0, "choices": []})
+    if "QProgressDialog" in globals():
+        globals()["QProgressDialog"].cancel_after = None
 
 
 def install() -> types.ModuleType:
@@ -88,6 +93,21 @@ def install() -> types.ModuleType:
         def __init__(self):
             pass
 
+    class IPluginDiagnose:
+        def __init__(self):
+            self.invalidations = 0
+
+        def _invalidate(self):
+            self.invalidations += 1
+
+    class ModDataContent:
+        class Content:
+            def __init__(self, id, name, icon, filter_only=False):
+                self.id, self.name, self.icon, self.filter_only = id, name, icon, filter_only
+
+        def __init__(self):
+            pass
+
     class PluginRequirementFactory:
         @staticmethod
         def gameDependency(names):
@@ -96,7 +116,7 @@ def install() -> types.ModuleType:
     for cls in (IPluginGame, ISaveGame, ModDataChecker, IFileTree, VersionInfo, PluginSetting,
                 ExecutableInfo, ExecutableForcedLoadSetting, ProfileSetting,
                 IPluginFileMapper, Mapping, GuessedString, ModState, IPluginTool,
-                PluginRequirementFactory):
+                PluginRequirementFactory, IPluginDiagnose, ModDataContent):
         setattr(mobase, cls.__name__, cls)
     mobase.IOrganizer = object
     mobase.getFileVersion = lambda path: ""
@@ -193,12 +213,69 @@ def install() -> types.ModuleType:
         def show(self):
             self.aboutToShow.emit()
 
+    class QCoreApplication:
+        @staticmethod
+        def applicationDirPath():
+            return APP_DIR[0]
+
+        @staticmethod
+        def applicationFilePath():
+            return APP_DIR[0] + "/ModOrganizer.exe"
+
+    class QThread:
+        level = [1]  # the event loop nesting of the "current thread": 0 before exec(), 1 in MO2's main loop
+
+        class _Current:
+            @staticmethod
+            def loopLevel():
+                return QThread.level[0]
+
+        @staticmethod
+        def currentThread():
+            return QThread._Current()
+
     class QTimer:
+        queue = None  # a list while a test wants timers held back until the "event loop" runs them
+
         @staticmethod
         def singleShot(msec, fn):
-            fn()  # the fake has no event loop: run it at once
+            if QTimer.queue is None:
+                fn()  # the fake has no event loop: run it at once
+            else:
+                QTimer.queue.append(fn)
+
+        @staticmethod
+        def run_queued():
+            while QTimer.queue:
+                QTimer.queue.pop(0)()
+
+    class QObject:
+        def __init__(self, *args):
+            pass
+
+    class pyqtSignal:
+        """A per-instance signal, delivered at once (the fake has no threads of its own)."""
+
+        def __init__(self, *types):
+            self._name = None
+
+        def __set_name__(self, owner, name):
+            self._name = "_signal_" + name
+
+        def __get__(self, instance, owner):
+            if instance is None:
+                return self
+            if self._name not in instance.__dict__:
+                instance.__dict__[self._name] = _Signal()
+            return instance.__dict__[self._name]
 
     class Qt:
+        class Orientation:
+            Horizontal = "horizontal"
+
+        class WindowModality:
+            WindowModal = "window"
+
         class CursorShape:
             WaitCursor = "wait"
 
@@ -207,7 +284,13 @@ def install() -> types.ModuleType:
 
     core.QDir, core.QFileInfo, core.QDateTime, core.QStandardPaths = QDir, QFileInfo, QDateTime, QStandardPaths
     core.Qt = Qt
+    core.QObject = QObject
+    core.pyqtSignal = pyqtSignal
     core.QTimer = QTimer
+    core.QThread = QThread
+    globals()["QThread"] = QThread  # exposed as fakes.QThread so tests can set the loop level
+    core.QCoreApplication = QCoreApplication
+    globals()["QTimer"] = QTimer  # exposed as fakes.QTimer so tests can hold timers back
     # Messages the plugin sends to MO2's log pane (qInfo/qWarning/qCritical).
     core.qInfo = lambda msg: LOG.append(("info", msg))
     core.qWarning = lambda msg: LOG.append(("warning", msg))
@@ -244,6 +327,10 @@ def install() -> types.ModuleType:
 
         class Icon:
             Information = "info"
+            Question = "question"
+
+        class ButtonRole:
+            AcceptRole, RejectRole, ActionRole = "accept", "reject", "action"
 
         @staticmethod
         def _record(kind, title, text):
@@ -269,10 +356,18 @@ def install() -> types.ModuleType:
 
         def __init__(self, parent=None):
             self.rich, self.text_value, self._buttons, self._escape = False, "", {}, None
-            self.clicked = None
+            self.clicked, self._added, self._default = None, [], None
 
         def setIcon(self, icon):
             pass
+
+        def addButton(self, text, role):
+            button = _Button(text)
+            self._added.append(button)
+            return button
+
+        def setDefaultButton(self, button):
+            self._default = button
 
         def setWindowTitle(self, title):
             self.title = title
@@ -293,6 +388,12 @@ def install() -> types.ModuleType:
             self._escape = button
 
         def exec(self):
+            if self._added:  # a question with custom buttons: answered from UI["choices"], else the default
+                labels = [b.text for b in self._added]
+                DIALOGS.append(("ask", getattr(self, "title", ""), self.text_value, labels))
+                wanted = UI["choices"].pop(0) if UI["choices"] else None
+                self.clicked = next((b for b in self._added if b.text == wanted), self._default or self._added[0])
+                return
             DIALOGS.append(("prompt", getattr(self, "title", ""), self.text_value))
             answer = UI["prompt"]  # "ok", "cancel" or "close" (window closed: escape button)
             self.clicked = self._escape if answer == "close" else self._buttons["Ok" if answer == "ok" else "Cancel"]
@@ -309,7 +410,49 @@ def install() -> types.ModuleType:
             pick = UI["item"]
             return (items[pick], True) if pick is not None else ("", False)
 
+    class QProgressDialog:
+        """Records its label and values; ``cancel_after`` cancels once that many updates have been made."""
+
+        cancel_after = None
+
+        def __init__(self, label, cancel, minimum, maximum, parent=None):
+            self.label, self.values, self._closed = label, [], False
+            PROGRESS.append(self)
+
+        def setWindowTitle(self, title):
+            pass
+
+        def setWindowModality(self, modality):
+            pass
+
+        def setMinimumDuration(self, ms):
+            pass
+
+        def setAutoClose(self, flag):
+            pass
+
+        def setAutoReset(self, flag):
+            pass
+
+        def setValue(self, value):
+            self.values.append(value)
+
+        def wasCanceled(self):
+            limit = QProgressDialog.cancel_after
+            return limit is not None and len(self.values) > limit
+
+        def close(self):
+            self._closed = True
+
     class QApplication:
+        @staticmethod
+        def processEvents():
+            pass
+
+        @staticmethod
+        def quit():
+            QUIT.append(1)
+
         @staticmethod
         def setOverrideCursor(cursor):
             CURSOR.append("set")
@@ -323,6 +466,9 @@ def install() -> types.ModuleType:
             return None
 
     widgets.QMessageBox, widgets.QInputDialog, widgets.QApplication = QMessageBox, QInputDialog, QApplication
+    widgets.QProgressDialog = QProgressDialog
+    widgets.QTreeView = type("QTreeView", (), {})
+    globals()["QProgressDialog"] = QProgressDialog
     sys.modules.update({"PyQt6": qt, "PyQt6.QtCore": core, "PyQt6.QtGui": gui, "PyQt6.QtWidgets": widgets})
     return mobase
 
@@ -366,6 +512,7 @@ class FakeModList:
         self.active: set[str] = set()
         self.installed_callbacks = []
         self.moved_callbacks, self.state_callbacks = [], []
+        self.removed_callbacks = []
         self.calls: list[tuple] = []          # changes made by the plugin (not by the "user")
         self.hook_runs = 0                    # how many hook invocations happened in total
         self.paths: dict[str, str] = {}       # mod name -> folder, for getMod().absolutePath()
@@ -376,6 +523,10 @@ class FakeModList:
 
     def onModMoved(self, cb):
         self.moved_callbacks.append(cb)
+        return True
+
+    def onModRemoved(self, cb):
+        self.removed_callbacks.append(cb)
         return True
 
     def onModStateChanged(self, cb):
@@ -434,6 +585,8 @@ class FakeOrganizer:
         self.base_path = "does-not-exist"  # instance dir holding ModOrganizer.ini
         self.mods_path = "does-not-exist"
         self.created: list[str] = []
+        self.refreshed: list[bool] = []
+        self.on_disk_after_refresh: list[str] = []   # mods MO2 finds on disk when it refreshes
         self.create_returns_none = False
         self.ui_callbacks, self.profile_callbacks = [], []
         self.about_to_run_callbacks, self.finished_callbacks = [], []
@@ -449,7 +602,11 @@ class FakeOrganizer:
         self._mod_list = FakeModList(self)
 
         class _Features:
+            def __init__(self):
+                self.registered = []  # (game, feature, priority, replace) for each registerFeature call
+
             def registerFeature(self, *args):
+                self.registered.append(args)
                 return True
 
         self._features = _Features()
@@ -499,6 +656,12 @@ class FakeOrganizer:
 
     def modDataChanged(self, mod):
         self.data_changed.append(mod)
+
+    def refresh(self, save_changes=True):
+        self.refreshed.append(save_changes)
+        for name in self.on_disk_after_refresh:
+            if name not in self._mod_list.names:
+                self._mod_list.names.append(name)
 
     def onUserInterfaceInitialized(self, cb):
         self.ui_callbacks.append(cb)
