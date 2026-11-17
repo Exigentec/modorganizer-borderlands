@@ -64,10 +64,13 @@ class Flow(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self._n = 0
 
+    hide_docs = False   # these tests are about placing content; DocsHidden turns the hiding on
+
     def game(self, spec=BORDERLANDS_4, pak_subdir=""):
         game = BorderlandsGame(spec)
         game._pak_subdir = lambda: pak_subdir      # the plugin setting, bypassing the organizer
         org = fakes.FakeOrganizer()
+        org.settings[(game.name(), "hide_documentation")] = self.hide_docs
         game.init(org)
         org.managed = game
         game.test_org = org
@@ -101,6 +104,56 @@ class Flow(unittest.TestCase):
     @staticmethod
     def checker(spec=BORDERLANDS_4):
         return BorderlandsModDataChecker(spec, lambda: "")
+
+
+class DocsHidden(Flow):
+    """Documentation a mod leaves in its root is hidden (MO2's own .mohidden) so it stays out of the game folder."""
+
+    hide_docs = True
+    PAK = E("OakGame", True, [E("Content", True, [E("Paks", True, [E("a.pak")])])])
+
+    def test_loose_readme_style_files_are_hidden_and_keep_their_content(self):
+        names = ["INSTALL.txt", "CHANGELOG.txt", "README.md", "WHERE_TO_INSTALL.txt", "WHERE_TO_ISTALL.txt",
+                 "Read Me First.txt", "setup.ini", "LICENSE"]
+        mod = self.mod_folder(FakeTree(self.PAK, *[E(n) for n in names]))
+        for n in names:
+            (mod / n).write_text("words")
+        self.game().test_fire(fakes.FakeMod(mod, name="m"))
+        self.assertEqual(self.files(mod), sorted(["OakGame/Content/Paks/a.pak"] + [n + ".mohidden" for n in names]))
+        self.assertEqual((mod / "INSTALL.txt.mohidden").read_text(), "words")
+        self.assertIn("hid 8 documentation file(s) in 'm'", " | ".join(m for _, m in fakes.LOG))
+
+    def test_a_docs_folder_has_its_files_hidden_but_other_folders_and_files_are_left_alone(self):
+        root = FakeTree(self.PAK, E("docs", True, [E("manual.pdf"), E("Shots", True, [E("a.png")])]),
+                        E("Extras", True, [E("README.txt"), E("data.bin")]), E("notes.json"), E("start.bat"))
+        verdict, files = self.install(root)
+        self.assertEqual(files, ["Extras/README.txt", "Extras/data.bin", "OakGame/Content/Paks/a.pak",
+                                 "docs/Shots/a.png.mohidden", "docs/manual.pdf.mohidden", "notes.json", "start.bat"])
+
+    def test_a_program_mods_files_and_the_game_folders_are_never_touched(self):
+        root = FakeTree(E("tool.exe"), E("README.txt"), E("OakGame", True, [E("README.txt")]))
+        _, files = self.install(root)
+        self.assertEqual(files, ["OakGame/README.txt", "Tools/fake mod/README.txt", "Tools/fake mod/tool.exe"])
+
+    def test_the_setting_turns_it_off(self):
+        DocsHidden.hide_docs = False
+        self.addCleanup(setattr, DocsHidden, "hide_docs", True)
+        _, files = self.install(FakeTree(self.PAK, E("INSTALL.txt")))
+        self.assertIn("INSTALL.txt", files)
+
+    def test_it_does_nothing_if_mo2_no_longer_skips_the_hidden_suffix(self):
+        game = self.game()
+        game._hide_is_effective = lambda: False
+        mod = self.mod_folder(FakeTree(self.PAK, E("INSTALL.txt")))
+        game.test_fire(fakes.FakeMod(mod, name="m"))
+        self.assertIn("INSTALL.txt", self.files(mod))
+        self.assertTrue([m for _, m in fakes.LOG if "left visible" in m])
+
+    def test_files_that_are_already_hidden_are_skipped(self):
+        mod = self.mod_folder(FakeTree(self.PAK, E("INSTALL.txt.mohidden")))
+        self.game().test_fire(fakes.FakeMod(mod, name="m"))
+        self.assertIn("INSTALL.txt.mohidden", self.files(mod))
+        self.assertFalse([m for _, m in fakes.LOG if "hid " in m])
 
 
 class Screenshots(Flow):
@@ -553,6 +606,31 @@ class DocumentationFolders(Flow):
         self.assertEqual(files, ["OakGame/Content/Paks/a.pak", "docs/readme.md"])
         self.assertEqual(fakes.LOG, [])                                   # nothing was moved, nothing to report
 
+    def test_docs_folders_are_recognised_by_file_name_too(self):
+        """README / INSTALL / changelog style names, with or without an extension, are documentation."""
+        notes = ["README", "Read Me First.txt", "INSTALL.md", "Installation.ini", "setup.ini", "start", "Changelog",
+                 "changes.txt", "LICENSE", "credits.txt", "FAQ.md", "what's new.txt"]
+        root = FakeTree(E("OakGame", True, [E("Content", True, [E("Paks", True, [E("a.pak")])])]),
+                        E("About", True, [E(n) for n in notes]))
+        verdict, files = self.install(root)
+        self.assertEqual(verdict, VALID)
+        self.assertEqual(files[0], "About/Changelog")                      # untouched, in the mod root
+        self.assertIn("OakGame/Content/Paks/a.pak", files)
+        self.assertEqual(len(files), len(notes) + 1)
+
+    def test_a_folder_with_an_unknown_file_is_not_documentation_even_beside_readmes(self):
+        for stray in ("start.bat", "data.bin", "setup.cfg"):                   # a name like "start" alone is not enough
+            root = FakeTree(E("OakGame", True, [E("Content", True, [E("Paks", True, [E("a.pak")])])]),
+                            E("Extras", True, [E("README.txt"), E(stray)]))
+            verdict, _ = self.install(root)
+            self.assertNotEqual(verdict, VALID, stray)
+
+    def test_setup_exe_is_a_program_not_documentation(self):
+        root = FakeTree(E("OakGame", True, [E("Content", True, [E("Paks", True, [E("a.pak")])])]),
+                        E("Extras", True, [E("README.txt"), E("setup.exe")]))
+        _, files = self.install(root)
+        self.assertIn("Tools/Extras/setup.exe", files)
+
     def test_an_empty_folder_counts_as_documentation(self):
         root = FakeTree(E("OakGame", True, [E("x.txt")]), E("empty", True))
         self.assertEqual(self.checker().dataLooksValid(root), VALID)
@@ -568,6 +646,109 @@ class DocumentationFolders(Flow):
         root = FakeTree(E("t.exe"), E("docs", True, [E("a.txt")]))
         _, files = self.install(root, name="T")
         self.assertEqual(files, ["Tools/T/docs/a.txt", "Tools/T/t.exe"])
+
+
+class RefreshAfterPlacing(Flow):
+    """MO2 judges a mod's layout before our install callback runs, so it must be asked to look again."""
+
+    def refreshes(self, game):
+        return len(game.test_org.data_changed)
+
+    def test_a_refresh_follows_a_placement(self):
+        game = self.game()
+        chosen = distinct_archive().find("~Mods")
+        game._checker.dataLooksValid(chosen)
+        game.test_fire(fakes.FakeMod(self.mod_folder(chosen), name="Mod"))
+        self.assertEqual(self.refreshes(game), 1)
+
+    def test_a_refresh_follows_a_program_placement_and_a_loose_pak(self):
+        for archive in (phaseloot_archive(), chosen_of(E("a_P.pak"))):
+            game = self.game()
+            game._checker.dataLooksValid(archive)
+            game.test_fire(fakes.FakeMod(self.mod_folder(archive), name="Mod"))
+            self.assertEqual(self.refreshes(game), 1)
+
+    def test_no_refresh_when_nothing_was_placed(self):
+        game = self.game()
+        mod = self.mod_folder(FakeTree(E("OakGame", True, [E("x.pak")])))
+        game._checker.dataLooksValid(FakeTree(E("OakGame", True, [E("x.pak")])))
+        game.test_fire(fakes.FakeMod(mod, name="Mod"))
+        self.assertEqual(self.refreshes(game), 0)
+
+    def test_no_refresh_when_the_dialog_never_accepted_the_content(self):
+        game = self.game()
+        game.test_fire(fakes.FakeMod(self.mod_folder(distinct_archive().find("~Mods")), name="Mod"))
+        self.assertEqual(self.refreshes(game), 0)
+
+    def test_no_refresh_when_every_move_was_blocked(self):
+        game = self.game()
+        chosen = chosen_of(E("x.pak"))
+        game._checker.dataLooksValid(chosen)
+        mod = self.mod_folder(chosen)
+        (mod / "OakGame/Content/Paks").mkdir(parents=True)
+        (mod / "OakGame/Content/Paks/x.pak").write_text("")
+        game._checker._pending = relocate.top_level_signature(mod)
+        game.test_fire(fakes.FakeMod(mod, name="Mod"))
+        self.assertEqual(self.refreshes(game), 0)
+
+    def test_the_refresh_waits_until_the_callback_has_returned(self):
+        fakes.QTimer.queue = []
+        self.addCleanup(setattr, fakes.QTimer, "queue", None)
+        game = self.game()
+        chosen = distinct_archive().find("~Mods")
+        game._checker.dataLooksValid(chosen)
+        game.test_fire(fakes.FakeMod(self.mod_folder(chosen), name="Mod"))
+        self.assertEqual(self.refreshes(game), 0)                      # not from inside MO2's callback
+        fakes.QTimer.run_queued()
+        self.assertEqual(self.refreshes(game), 1)
+
+    def test_back_to_back_installs_share_one_refresh(self):
+        fakes.QTimer.queue = []
+        self.addCleanup(setattr, fakes.QTimer, "queue", None)
+        game = self.game()
+        for name in ("One", "Two"):
+            archive = distinct_archive().find("~Mods")
+            game._checker.dataLooksValid(archive)
+            game.test_fire(fakes.FakeMod(self.mod_folder(archive), name=name))
+        fakes.QTimer.run_queued()
+        self.assertEqual(self.refreshes(game), 1)
+        game._checker.dataLooksValid(distinct_archive().find("~Mods"))
+        game.test_fire(fakes.FakeMod(self.mod_folder(distinct_archive().find("~Mods")), name="Three"))
+        fakes.QTimer.run_queued()
+        self.assertEqual(self.refreshes(game), 2)                      # a later install gets its own
+
+    def test_the_mods_current_object_is_used_when_it_is_in_the_list(self):
+        fakes.QTimer.queue = []
+        self.addCleanup(setattr, fakes.QTimer, "queue", None)
+        game = self.game()
+        game.test_org.modList().names.append("Mod")
+        game.test_org.modList().paths["Mod"] = str(self.root)
+        chosen = distinct_archive().find("~Mods")
+        game._checker.dataLooksValid(chosen)
+        old = fakes.FakeMod(self.mod_folder(chosen), name="Mod")
+        game.test_fire(old)
+        fakes.QTimer.run_queued()
+        (current,) = game.test_org.data_changed
+        self.assertIsNot(current, old)                                  # re-fetched, not the stale pointer
+        self.assertEqual(current.name(), "Mod")
+
+    def test_a_failing_refresh_never_breaks_the_install(self):
+        game = self.game()
+        game.test_org.modDataChanged = mock.Mock(side_effect=RuntimeError("no refresh"))
+        chosen = distinct_archive().find("~Mods")
+        game._checker.dataLooksValid(chosen)
+        game.test_fire(fakes.FakeMod(self.mod_folder(chosen), name="Mod"))
+        self.assertTrue([m for lvl, m in fakes.LOG if "could not refresh MO2's view of 'Mod'" in m])
+
+    def test_a_failed_refresh_does_not_block_the_next_one(self):
+        game = self.game()
+        calls = []
+        game.test_org.modDataChanged = lambda mod: (calls.append(1), (_ for _ in ()).throw(RuntimeError("x")))
+        for name in ("A", "B"):
+            archive = distinct_archive().find("~Mods")
+            game._checker.dataLooksValid(archive)
+            game.test_fire(fakes.FakeMod(self.mod_folder(archive), name=name))
+        self.assertEqual(len(calls), 2)
 
 
 class ProgramAnnouncement(Flow):

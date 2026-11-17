@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import mobase
@@ -11,10 +12,21 @@ from PyQt6.QtCore import QDateTime, QDir, QFileInfo, QStandardPaths, QTimer, qIn
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from . import layout, modmeta, redirects, relocate, steam, tools
-from .spec import GameSpec, Redirect
+from . import layout, modmeta, redirects, relocate, sdkcontent, steam, tools, ui
+from .spec import PAK_SUFFIXES, GameSpec, Redirect
 
 PAK_SUBDIR_SETTING = "pak_subdir"
+HIDE_DOCS_SETTING = "hide_documentation"
+
+
+@dataclass(frozen=True)
+class _Pin:
+    """A mod the plugin keeps enabled and at one end of the mod list, "locked" like Overwrite."""
+
+    name: str
+    last: bool                       # True: highest priority (just under Overwrite); False: lowest
+    why: str                         # what it is for, for the log
+    redirect: Redirect | None = None  # set for redirect mods
 
 
 class BorderlandsSaveGame(mobase.ISaveGame):
@@ -137,7 +149,9 @@ class BorderlandsGame(mobase.IPluginGame, mobase.IPluginFileMapper):
         self._spec = spec
         self._gamePath = ""
         self._enforcing = False  # True while we change the mod list ourselves
+        self._adopting: set[str] = set()  # pinned mods found on disk and waiting for MO2 to list them
         self._refresh_pending = False  # a post-install check is already scheduled
+        self._refresh_scheduled = False  # a refresh after moving a mod's files is already queued
         self._organizer: mobase.IOrganizer
 
     # -- helpers ---------------------------------------------------------------
@@ -164,9 +178,15 @@ class BorderlandsGame(mobase.IPluginGame, mobase.IPluginFileMapper):
         self._organizer = organizer
         self._checker = BorderlandsModDataChecker(self._spec, self._pak_subdir)
         organizer.gameFeatures().registerFeature(self, self._checker, 0, True)
+        has_paks = any(".pak" in rule.suffixes for rule in self._spec.move_rules)
+        if self._spec.sdk or has_paks:
+            # marks mods that hold SDK mods and/or pak files in the mod list's Content column
+            self._sdk_content = sdkcontent.SdkModContent(sdk=bool(self._spec.sdk),
+                                                         pak_suffixes=PAK_SUFFIXES if has_paks else ())
+            organizer.gameFeatures().registerFeature(self, self._sdk_content, 0, True)
         organizer.modList().onModInstalled(self._on_mod_installed)
-        if self._spec.redirects:
-            # Keep the redirect mods present and last, then record deletions on exit.
+        if self._pins():
+            # Keep the pinned mods present and in place, and record deletions in the redirects on exit.
             organizer.onUserInterfaceInitialized(lambda _window: self._sync_redirect_mods())
             organizer.onProfileChanged(lambda _old, _new: self._sync_redirect_mods())
             organizer.onAboutToRun(self._before_run)
@@ -176,6 +196,32 @@ class BorderlandsGame(mobase.IPluginGame, mobase.IPluginFileMapper):
             organizer.modList().onModMoved(self._on_mod_moved)
             organizer.modList().onModStateChanged(self._on_mod_state_changed)
         return True
+
+    # -- pinned mods: redirects (highest priority) and the SDK's mod (lowest) --------
+
+    def _sdk_support(self) -> bool:
+        """The tools plugin's ``sdk_support`` setting (on by default): the SDK's mod is only pinned when on."""
+        try:
+            value = self._organizer.pluginSetting("Borderlands Tools", "sdk_support")
+        except Exception:
+            return True
+        return True if value is None else (value is True or str(value).strip().casefold() in ("1", "true", "yes"))
+
+    def _pins(self) -> list[_Pin]:
+        pins: list[_Pin] = []
+        for r in self._spec.redirects:  # redirects may share a mod: one pin per mod, naming every folder
+            same = [x for x in self._spec.redirects if x.mod_name == r.mod_name]
+            if any(p.name == r.mod_name for p in pins):
+                continue
+            folders = " and ".join(f"{x.game_dir}/" for x in same)
+            pins.append(_Pin(r.mod_name, True, f"receives the files written under {folders}", r))
+        if self._spec.sdk and self._sdk_support():
+            pins.append(_Pin(self._spec.sdk.mod_name, False, "holds the SDK's files, which the plugin keeps in step "
+                                                             "with the release"))
+        return pins
+
+    def _pin_text(self, pin: _Pin) -> str:
+        return ("last, directly before Overwrite" if pin.last else "first, at the lowest priority")
 
     # -- redirects: IPluginFileMapper and mod list entry -----------------------
 
@@ -209,22 +255,49 @@ class BorderlandsGame(mobase.IPluginGame, mobase.IPluginFileMapper):
             )
         return result
 
-    def _ensure_redirect_mod(self, r: Redirect) -> None:
-        """Make sure the redirect's mod exists in the list, is enabled and sits last.
+    def _ensure_pinned(self, pin: _Pin) -> None:
+        """Make sure the pinned mod exists in the list, is enabled and sits where it belongs.
 
         The plugin API cannot restyle a mod row or turn it into a real Overwrite, so it
-        is an ordinary mod kept at the highest priority (just under Overwrite).
+        is an ordinary mod kept at one end of the list.
         """
         mod_list = self._organizer.modList()
-        if mod_list.getMod(r.mod_name) is None:
-            # Only when absent: createMod would otherwise prompt the user to merge.
-            if self._organizer.createMod(mobase.GuessedString(r.mod_name)) is None:
-                print(f"Borderlands: could not create mod '{r.mod_name}'.", file=sys.stderr)
+        if mod_list.getMod(pin.name) is None:
+            if (Path(self._organizer.modsPath()) / pin.name).exists():
+                # The folder is there but MO2 has not listed it: createMod would ask "Mod Exists: Merge /
+                # Replace / Rename" (and Replace sets the old folder aside as "<name>_backup").  Let MO2 look
+                # at the disk instead.
+                self._adopt_from_disk(pin)
                 return
-        self._enforce_redirect_mod(r)
+            if self._organizer.createMod(mobase.GuessedString(pin.name)) is None:
+                print(f"Borderlands: could not create mod '{pin.name}'.", file=sys.stderr)
+                return
+        self._enforce_pin(pin)
 
-    def _enforce_redirect_mod(self, r: Redirect) -> tuple[bool, bool]:
-        """Re-enable the mod and put it last (just under Overwrite) if it is not.
+    def _adopt_from_disk(self, pin: _Pin) -> None:
+        """A pinned mod's folder exists but MO2's list lacks it: refresh the list (once, in the real event
+        loop), then pin it."""
+        if pin.name in self._adopting:
+            return
+        self._adopting.add(pin.name)
+
+        def work() -> None:
+            try:
+                self._organizer.refresh(False)
+                if self._organizer.modList().getMod(pin.name) is None:
+                    qWarning(f"Borderlands: '{pin.name}' is in the mods folder but MO2 does not list it, so it "
+                             "cannot be pinned. Remove or rename that folder.")
+                else:
+                    self._enforce_pin(pin)
+            except Exception as err:
+                qWarning(f"Borderlands: could not pick up '{pin.name}': {err}")
+            finally:
+                self._adopting.discard(pin.name)
+
+        ui.when_running(work)
+
+    def _enforce_pin(self, pin: _Pin) -> tuple[bool, bool]:
+        """Re-enable the mod and put it back at its end of the list if it is not there.
 
         Returns ``(re_enabled, re_pinned)`` so callers can tell the user what was undone.
         Our own corrections fire the move/state hooks again, hence the guard.
@@ -232,73 +305,80 @@ class BorderlandsGame(mobase.IPluginGame, mobase.IPluginFileMapper):
         if self._enforcing:
             return False, False
         mod_list = self._organizer.modList()
-        if mod_list.getMod(r.mod_name) is None:
+        if mod_list.getMod(pin.name) is None:
             return False, False
         re_enabled = re_pinned = False
         self._enforcing = True
         try:
-            if not mod_list.state(r.mod_name) & mobase.ModState.ACTIVE:
-                mod_list.setActive(r.mod_name, True)
+            if not mod_list.state(pin.name) & mobase.ModState.ACTIVE:
+                mod_list.setActive(pin.name, True)
                 re_enabled = True
             names = mod_list.allModsByProfilePriority()
             ranked = [n for n in names if n.casefold() != "overwrite"]
-            if ranked[-1:] != [r.mod_name]:
-                mod_list.setPriority(r.mod_name, len(names))  # past the end means "last"
+            if pin.last:
+                if ranked[-1:] != [pin.name]:
+                    mod_list.setPriority(pin.name, len(names))  # past the end means "last"
+                    re_pinned = True
+            elif ranked[:1] != [pin.name]:
+                mod_list.setPriority(pin.name, 0)
                 re_pinned = True
         finally:
             self._enforcing = False
         return re_enabled, re_pinned
 
     def _on_mod_moved(self, moved: str = "", *_args) -> None:
-        """Any move may have displaced a redirect mod from last place."""
+        """Any move may have displaced a pinned mod from its place."""
         if self._enforcing or not self.isActive():
             return
-        for r in self._spec.redirects:
+        for pin in self._pins():
             try:
-                _, re_pinned = self._enforce_redirect_mod(r)
+                _, re_pinned = self._enforce_pin(pin)
             except Exception as err:
-                print(f"Borderlands: could not re-pin '{r.mod_name}': {err}", file=sys.stderr)
+                print(f"Borderlands: could not re-pin '{pin.name}': {err}", file=sys.stderr)
                 continue
             if re_pinned:
-                if moved == r.mod_name:
-                    cause = f"'{r.mod_name}' cannot be moved"
+                if moved == pin.name:
+                    cause = f"'{pin.name}' cannot be moved"
                 elif moved:
-                    cause = f"'{moved}' cannot be placed below '{r.mod_name}'"
+                    side = "below" if pin.last else "above"
+                    cause = f"'{moved}' cannot be placed {side} '{pin.name}'"
                 else:
-                    cause = f"'{r.mod_name}' cannot be displaced"
-                qWarning(
-                    f"Borderlands: {cause}. It stays last, directly before Overwrite, so it "
-                    "receives the writes redirected to it; it was moved back."
-                )
+                    cause = f"'{pin.name}' cannot be displaced"
+                if pin.last:
+                    ending = "so it receives the writes redirected to it"
+                else:
+                    ending = "so every other mod can override its files"
+                qWarning(f"Borderlands: {cause}. It stays {self._pin_text(pin)}, {ending}; it was moved back.")
 
     def _on_mod_state_changed(self, states) -> None:
-        """Turn a redirect mod back on if the user (or anything) deactivated it."""
+        """Turn a pinned mod back on if the user (or anything) deactivated it."""
         if self._enforcing or not self.isActive():
             return
-        for r in self._spec.redirects:
-            state = states.get(r.mod_name) if hasattr(states, "get") else None
+        for pin in self._pins():
+            state = states.get(pin.name) if hasattr(states, "get") else None
             if state is None or state & mobase.ModState.ACTIVE:
                 continue
             try:
-                re_enabled, _ = self._enforce_redirect_mod(r)
+                re_enabled, _ = self._enforce_pin(pin)
             except Exception as err:
-                print(f"Borderlands: could not re-enable '{r.mod_name}': {err}", file=sys.stderr)
+                print(f"Borderlands: could not re-enable '{pin.name}': {err}", file=sys.stderr)
                 continue
             if re_enabled:
-                qWarning(
-                    f"Borderlands: '{r.mod_name}' cannot be deactivated. It receives the "
-                    f"files written under {r.game_dir}/, so it was re-enabled."
-                )
+                qWarning(f"Borderlands: '{pin.name}' cannot be deactivated. It {pin.why}, so it was re-enabled.")
 
     def _sync_redirect_mods(self) -> None:
         if not self.isActive():
             return
-        for r in self._spec.redirects:
+        for pin in self._pins():
             try:
-                redirects.target_dir(self._organizer.modsPath(), r).mkdir(parents=True, exist_ok=True)
-                self._ensure_redirect_mod(r)
+                folders = ([redirects.target_dir(self._organizer.modsPath(), r) for r in self._spec.redirects
+                            if r.mod_name == pin.name]
+                           or [Path(self._organizer.modsPath()) / pin.name])
+                self._ensure_pinned(pin)      # before the folders are made: see _ensure_pinned
+                for folder in folders:
+                    folder.mkdir(parents=True, exist_ok=True)
             except Exception as err:
-                print(f"Borderlands: could not set up '{r.mod_name}': {err}", file=sys.stderr)
+                print(f"Borderlands: could not set up '{pin.name}': {err}", file=sys.stderr)
 
     def _before_run(self, _app: str) -> bool:
         self._sync_redirect_mods()
@@ -326,10 +406,40 @@ class BorderlandsGame(mobase.IPluginGame, mobase.IPluginFileMapper):
             return
         self._relocate_content(mod)
         self._announce_programs(mod)
-        if self._spec.redirects:
+        if self._pins():
             self._repin_redirects(f"installing '{mod.name()}'")
             self._repin_after_next_refresh()
+        self._hide_documentation(mod)
         self._apply_metadata(mod)
+
+    def _hide_documentation(self, mod: mobase.IModInterface) -> None:
+        """Keep a mod's README / INSTALL / changelog files (and docs folders) out of the game folder.
+
+        They are renamed to ``<name>.mohidden``, MO2's own "hide" (the VFS skips that suffix); the mod
+        keeps them and MO2's Filetree tab can unhide them.  Never raises.
+        """
+        try:
+            value = self._organizer.pluginSetting(self.name(), HIDE_DOCS_SETTING)
+            if not (value is True or str(value).strip().casefold() in ("1", "true", "yes")):
+                return  # off unless the user turned it on
+            if not self._hide_is_effective():
+                qWarning("Borderlands: MO2's skip_file_suffixes no longer lists .mohidden, so documentation "
+                         f"files in '{mod.name()}' were left visible.")
+                return
+            hidden = []
+            for path in relocate.docs_to_hide(self._spec, Path(mod.absolutePath()), modmeta.HIDDEN_SUFFIX):
+                try:
+                    modmeta.hide(path)
+                    hidden.append(path.name)
+                except OSError as err:
+                    qWarning(f"Borderlands: could not hide '{path.name}' in '{mod.name()}': {err}")
+            if hidden:
+                shown = ", ".join(hidden[:6]) + (f" and {len(hidden) - 6} more" if len(hidden) > 6 else "")
+                qInfo(f"Borderlands: hid {len(hidden)} documentation file(s) in '{mod.name()}' from the game "
+                      f"folder ({shown}); unhide them in the mod's Filetree tab if you want them visible.")
+                self._schedule_refresh(mod)
+        except Exception as err:
+            qWarning(f"Borderlands: could not hide the documentation of '{mod.name()}': {err}")
 
     def _relocate_content(self, mod: mobase.IModInterface) -> None:
         """Place content the install dialog accepted (see the checker's docstring).
@@ -344,10 +454,37 @@ class BorderlandsGame(mobase.IPluginGame, mobase.IPluginFileMapper):
             mod_dir = Path(mod.absolutePath())
             if relocate.top_level_signature(mod_dir) != pending:
                 return
+            moved = False
             for level, text in relocate.relocate(self._spec, mod_dir, self._pak_subdir(), mod.name()):
                 (qWarning if level == "warning" else qInfo)(text)
+                moved = moved or level == "info"  # only a placement reports at info level
+            if moved:
+                self._schedule_refresh(mod)
         except Exception as err:
             qWarning(f"Borderlands: could not place the content of '{mod.name()}': {err}")
+
+    def _schedule_refresh(self, mod: mobase.IModInterface) -> None:
+        """Have MO2 look at the mod again now that its files have moved.
+
+        MO2 scans a mod, and decides whether its layout "looks valid", before it calls the
+        installed-mod callback, so without this a mod we just placed keeps showing as invalid
+        until the next manual refresh.  ``modDataChanged`` is a full refresh; it runs once, after
+        the callback and MO2's own post-install work have finished, not from inside them.
+        """
+        if self._refresh_scheduled:
+            return
+        self._refresh_scheduled = True
+        name = mod.name()
+
+        def refresh() -> None:
+            self._refresh_scheduled = False
+            try:
+                current = self._organizer.modList().getMod(name) or mod  # the pointer may have changed
+                self._organizer.modDataChanged(current)
+            except Exception as err:
+                qWarning(f"Borderlands: could not refresh MO2's view of '{name}': {err}")
+
+        QTimer.singleShot(0, refresh)
 
     def _announce_programs(self, mod: mobase.IModInterface) -> None:
         """Tell the user that an installed mod ships programs, and where to start them.
@@ -373,15 +510,15 @@ class BorderlandsGame(mobase.IPluginGame, mobase.IPluginFileMapper):
             qWarning(f"Borderlands: could not list the programs of '{mod.name()}': {err}")
 
     def _repin_redirects(self, reason: str) -> None:
-        """Put the redirect mods back last if something (an install) displaced them."""
-        for r in self._spec.redirects:
+        """Put the pinned mods back in place if something (an install) displaced them."""
+        for pin in self._pins():
             try:
-                _, re_pinned = self._enforce_redirect_mod(r)
+                _, re_pinned = self._enforce_pin(pin)
             except Exception as err:
-                print(f"Borderlands: could not re-pin '{r.mod_name}': {err}", file=sys.stderr)
+                print(f"Borderlands: could not re-pin '{pin.name}': {err}", file=sys.stderr)
                 continue
             if re_pinned:
-                qInfo(f"Borderlands: '{r.mod_name}' was kept last, directly before Overwrite, after {reason}.")
+                qInfo(f"Borderlands: '{pin.name}' was kept {self._pin_text(pin)}, after {reason}.")
 
     def _repin_after_next_refresh(self) -> None:
         """A new mod may only get its priority after the install callback has run.
@@ -456,17 +593,24 @@ class BorderlandsGame(mobase.IPluginGame, mobase.IPluginFileMapper):
         return bool(managed) and self.name() == managed.name()
 
     def settings(self) -> list[mobase.PluginSetting]:
-        if self._spec.default_pak_subdir is None:
-            return []
-        return [
+        settings = [
             mobase.PluginSetting(
+                HIDE_DOCS_SETTING,
+                "When a mod is installed, hide its README / INSTALL / changelog style files (and folders of "
+                "nothing but documentation or pictures) from the game folder, using MO2's own hide. Off by "
+                "default; only affects mods installed afterwards.",
+                False,
+            )
+        ]
+        if self._spec.default_pak_subdir is not None:
+            settings.append(mobase.PluginSetting(
                 PAK_SUBDIR_SETTING,
                 "Folder under OakGame/Content/Paks that loose .pak/.utoc/.ucas files "
                 "in a mod are moved into when the mod is installed. Leave empty to use "
                 "Paks itself.",
                 self._spec.default_pak_subdir,
-            )
-        ]
+            ))
+        return settings
 
     # -- IPluginGame: identity and discovery ----------------------------------
 

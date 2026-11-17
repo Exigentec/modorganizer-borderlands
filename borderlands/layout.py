@@ -6,6 +6,7 @@ No MO2 or Qt imports, so this is unit-testable outside the MO2 process.
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -13,6 +14,26 @@ from .spec import GameSpec
 
 # Documentation and pictures: a folder holding only these is not mod content, so it is left alone.
 DOC_SUFFIXES = frozenset({".txt", ".md", ".pdf", ".rtf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"})
+
+# Documentation by name, with or without an extension (README, INSTALL, "Read Me First.txt", ...).  Matched
+# against the whole file name, ignoring case, so "setup.exe" or "start.bat" are not documentation.
+DOC_NAME = re.compile(
+    r"(change[ _-]?logs?|changes|history|what'?s[ _-]?new|install(ing|ation)?|where[ _-]?to[ _-]?in?stall|"
+    r"instructions?|setup|start(up)?|"
+    r"read[ _-]?me([ _-]?first)?|read|licen[cs]e|credits?|notes|faq|about)"
+    r"(\.(txt|ini|md|rtf|pdf|html?|nfo|url))?",
+    re.IGNORECASE,
+)
+
+
+def is_doc(name: str) -> bool:
+    """Documentation or a picture: ignored when deciding whether a folder holds mod content."""
+    return _suffix(name) in DOC_SUFFIXES or is_doc_name(name)
+
+
+def is_doc_name(name: str) -> bool:
+    """Named like documentation (README, INSTALL.txt, WHERE_TO_INSTALL, changelog ...), whatever it holds."""
+    return DOC_NAME.fullmatch(name) is not None
 
 
 class Verdict(enum.Enum):
@@ -149,7 +170,7 @@ def _suffix_files(node: Node, suffixes: tuple[str, ...]) -> list[tuple[str, ...]
 
 def _is_inert(node: Node) -> bool:
     """A folder with no files, or only documentation and pictures."""
-    return all(_suffix(n.name) in DOC_SUFFIXES for _, n in _files(node))
+    return all(is_doc(n.name) for _, n in _files(node))
 
 
 def _rule_actions(node: Node, rule, pak_subdir: str) -> list[Action]:

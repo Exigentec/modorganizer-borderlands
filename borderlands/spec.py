@@ -27,10 +27,13 @@ class Redirect:
     # overwriting), so edits to them are captured instead of changing the originals.
     seed_existing: bool = True
     deleted_suffix: str = ".deleted"
+    # Several redirects may share one mod (each folder lands in its own subfolder of it); each needs its
+    # own record of what it held, so a second redirect for the same mod gives itself a different key.
+    manifest_key: str = ""
 
     @property
     def slug(self) -> str:
-        return re.sub(r"[^A-Za-z0-9]+", "_", self.mod_name).strip("_").lower()
+        return re.sub(r"[^A-Za-z0-9]+", "_", self.manifest_key or self.mod_name).strip("_").lower()
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,20 @@ class NestedRule:
 
 
 @dataclass(frozen=True)
+class SdkSpec:
+    """The modding SDK this game needs, published as a zip on a GitHub release."""
+
+    repo: str   # "owner/name"
+    asset: str  # file name of the release asset, also the name of the cached copy
+    # The mod that holds the archive's entire contents, kept at the lowest priority and managed by
+    # the plugin (like a redirect mod, but at the other end of the list).
+    mod_name: str = "SDK Mod Support"
+    # Files under these folders (game-folder relative, forward slashes) must also be real files in
+    # the game folder: the game loads the SDK's loader before the virtual file system is in place.
+    real_prefixes: tuple[str, ...] = ("OakGame/Binaries/",)
+
+
+@dataclass(frozen=True)
 class GameSpec:
     plugin_name: str
     game_name: str
@@ -99,12 +116,16 @@ class GameSpec:
     description: str = ""
     redirects: tuple[Redirect, ...] = ()
     nested_rules: tuple[NestedRule, ...] = ()
+    sdk: SdkSpec | None = None
 
 
-# Settings written by pyunrealsdk mods.  Add siblings here later, e.g.
-# Redirect("SDK Keybinds", "sdk_mods/keybinds", seed_existing=False): that folder also
-# holds the keybinds package itself, which should not be copied.
+# Settings written by pyunrealsdk mods, and the keybinds the SDK's keybinds package saves: both end up
+# in the one mod "SDK Mod Settings" (under sdk_mods/settings and sdk_mods/keybinds).  The keybinds
+# folder also holds the keybinds package itself (code, supplied by the SDK's own mod), which must
+# never be copied, hence seed_existing=False.
 SDK_MOD_SETTINGS = Redirect("SDK Mod Settings", "sdk_mods/settings")
+SDK_KEYBINDS = Redirect("SDK Mod Settings", "sdk_mods/keybinds", seed_existing=False,
+                        manifest_key="SDK Mod Settings keybinds")
 
 # Standalone helper programs shipped as mods ("Tools/<name>/<name>.exe"), valid for every game.
 TOOLS_DIR = "tools"
@@ -115,6 +136,7 @@ _WILLOW_INIS = (
     "WillowGame/Config/WillowInput.ini",
 )
 _PAK_SUFFIXES = (".pak", ".utoc", ".ucas")
+PAK_SUFFIXES = _PAK_SUFFIXES
 
 # UE paks mount recursively, so a mod's own subfolders are kept as they are (they often
 # hold identically named paks, e.g. one folder per language).
@@ -232,8 +254,9 @@ BORDERLANDS_4 = GameSpec(
     # Existing BL4 mods on disk sit directly in Content/Paks, not in a subfolder.
     default_pak_subdir="",
     description="Adds support for Borderlands 4 (Steam), including pyunrealsdk .sdkmod mods.",
-    redirects=(SDK_MOD_SETTINGS,),
+    redirects=(SDK_MOD_SETTINGS, SDK_KEYBINDS),
     nested_rules=(PAK_NESTED, *SDK_NESTED, TOOL_NESTED),
+    sdk=SdkSpec("bl-sdk/oak2-mod-manager", "oak2-sdk.zip"),
 )
 
 ALL_SPECS = (

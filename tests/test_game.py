@@ -1,3 +1,4 @@
+import dataclasses
 import unittest
 
 from tests import fakes
@@ -19,7 +20,11 @@ class CreatePlugins(unittest.TestCase):
         from borderlands.toolsmenu import BorderlandsTools
         plugins = borderlands.createPlugins()
         self.assertEqual(sum(isinstance(p, BorderlandsTools) for p in plugins), 1)
-        self.assertEqual(len(plugins), 6)
+        from borderlands.sdkdiagnose import SdkDiagnose
+        self.assertEqual(sum(isinstance(p, SdkDiagnose) for p in plugins), 1)
+        self.assertEqual(len(plugins), 7)
+        (tools,) = [p for p in plugins if isinstance(p, BorderlandsTools)]
+        self.assertIsNotNone(tools.diagnose)
 
     def test_one_plugin_per_game_with_unique_names(self):
         plugins = game_plugins()
@@ -45,10 +50,10 @@ class CreatePlugins(unittest.TestCase):
 
     def test_settings_only_for_pak_games(self):
         by_short = {p.gameShortName(): p for p in game_plugins()}
-        self.assertEqual([s.key for s in by_short["borderlands3"].settings()], ["pak_subdir"])
-        self.assertEqual(by_short["borderlands3"].settings()[0].default, "~mods")
-        self.assertEqual(by_short["borderlands4"].settings()[0].default, "")
-        self.assertEqual(by_short["borderlands2"].settings(), [])
+        self.assertEqual([s.key for s in by_short["borderlands3"].settings()], ["hide_documentation", "pak_subdir"])
+        self.assertEqual({s.key: s.default for s in by_short["borderlands3"].settings()}["pak_subdir"], "~mods")
+        self.assertEqual({s.key: s.default for s in by_short["borderlands4"].settings()}["pak_subdir"], "")
+        self.assertEqual([(s.key, s.default) for s in by_short["borderlands2"].settings()], [("hide_documentation", False)])
 
     def test_paths(self):
         game = BorderlandsGame(BORDERLANDS_4)
@@ -168,7 +173,8 @@ class RedirectHooks(unittest.TestCase):
         self.instance.mkdir()
 
         fakes.LOG.clear()
-        self.game = BorderlandsGame(BORDERLANDS_4)
+        # without the SDK's own pinned mod, so these tests are about the redirect mod alone
+        self.game = BorderlandsGame(dataclasses.replace(BORDERLANDS_4, sdk=None))
         self.org = fakes.FakeOrganizer()
         self.org.mods_path, self.org.base_path = str(self.mods), str(self.instance)
         self.game.init(self.org)
@@ -193,11 +199,51 @@ class RedirectHooks(unittest.TestCase):
     # -- mappings ------------------------------------------------------------
 
     def test_mapping_is_a_create_target_directory_mapping(self):
-        (mapping,) = self.game.mappings()
-        self.assertEqual(mapping.source, str(self.target))
-        self.assertEqual(mapping.destination, str(self.game_dir / "sdk_mods" / "settings"))
-        self.assertTrue(mapping.is_directory)
-        self.assertTrue(mapping.create_target)
+        settings, keybinds = self.game.mappings()
+        self.assertEqual(settings.source, str(self.target))
+        self.assertEqual(settings.destination, str(self.game_dir / "sdk_mods" / "settings"))
+        self.assertTrue(settings.is_directory)
+        self.assertTrue(settings.create_target)
+        self.assertEqual(keybinds.source, str(self.mods / "SDK Mod Settings" / "sdk_mods" / "keybinds"))
+        self.assertEqual(keybinds.destination, str(self.game_dir / "sdk_mods" / "keybinds"))
+        self.assertTrue(keybinds.create_target)
+
+    def test_keybinds_writes_go_to_the_same_mod_and_never_seed_from_the_game_folder(self):
+        keybinds = self.game_dir / "sdk_mods" / "keybinds"
+        keybinds.mkdir(parents=True)
+        (keybinds / "__init__.py").write_text("package code")
+        self.game.mappings()
+        kb_target = self.mods / "SDK Mod Settings" / "sdk_mods" / "keybinds"
+        self.assertTrue(kb_target.is_dir())
+        self.assertEqual(list(kb_target.iterdir()), [])                       # the package is not copied
+        self.assertEqual((self.target / "a.json").read_text(), "A")           # settings still seed
+        self.assertEqual(sorted(p.name for p in self.mods.iterdir()), ["SDK Mod Settings"])
+
+    def test_the_two_folders_keep_separate_records_of_what_they_held(self):
+        from borderlands import redirects
+        from borderlands.spec import SDK_KEYBINDS, SDK_MOD_SETTINGS
+        state = self.instance / "plugin_state" / "borderlands"
+        self.assertNotEqual(redirects.manifest_path(state, SDK_MOD_SETTINGS), redirects.manifest_path(state, SDK_KEYBINDS))
+        self.assertEqual(redirects.manifest_path(state, SDK_MOD_SETTINGS).name, "sdk_mod_settings.manifest.json")  # as before
+        self.game.mappings()
+        (self.mods / "SDK Mod Settings" / "sdk_mods" / "keybinds" / "binds.json").write_text("{}")
+        self.game._after_run()
+        self.game.mappings()
+        self.assertTrue((self.target / "a.json").exists())                    # the other folder's files are not "deleted"
+        self.assertFalse(list((self.mods / "SDK Mod Settings").rglob("*.deleted")))
+        (self.mods / "SDK Mod Settings" / "sdk_mods" / "keybinds" / "binds.json").unlink()
+        self.game._before_run("x")
+        self.game.mappings()
+        self.assertTrue((self.mods / "SDK Mod Settings" / "sdk_mods" / "keybinds" / "binds.json.deleted").exists())
+        self.assertFalse((self.target / "a.json.deleted").exists())
+
+    def test_one_pin_serves_both_folders(self):
+        pins = self.game._pins()
+        self.assertEqual([p.name for p in pins], ["SDK Mod Settings"])
+        self.assertIn("sdk_mods/settings/ and sdk_mods/keybinds/", pins[0].why)
+        self.org.modList().names[:] = ["alpha"]
+        self.org.ui_callbacks[0](object())
+        self.assertEqual(self.org.created, ["SDK Mod Settings"])               # once, not once per folder
 
     def test_mappings_seed_the_mod_from_the_real_folder(self):
         self.game.mappings()
@@ -457,6 +503,152 @@ class RedirectHooks(unittest.TestCase):
         self.org.finished_callbacks[0]("x", 0)               # must not raise
 
 
+class SupportModPin(unittest.TestCase):
+    """'SDK Mod Support': pinned at the lowest priority, next to 'SDK Mod Settings' at the highest."""
+
+    SUPPORT, SETTINGS = "SDK Mod Support", "SDK Mod Settings"
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.game_dir, self.mods, self.instance = root / "game", root / "mods", root / "instance"
+        for folder in (self.game_dir, self.mods, self.instance):
+            folder.mkdir()
+        fakes.LOG.clear()
+        self.game = BorderlandsGame(BORDERLANDS_4)
+        self.org = fakes.FakeOrganizer()
+        self.org.mods_path, self.org.base_path = str(self.mods), str(self.instance)
+        self.org.settings[("Borderlands Tools", "sdk_support")] = True   # off by default, see SdkSwitchOff
+        self.game.init(self.org)
+        self.game.setGamePath(self.game_dir)
+        self.org.managed = self.game
+        self.mod_list = self.org.modList()
+        self.mod_list.names[:] = ["alpha", "beta"]
+        self.mod_list.active.update(["alpha", "beta"])
+
+    def start(self):
+        self.org.ui_callbacks[0](None)
+
+    def warnings(self):
+        return [m for lvl, m in fakes.LOG if lvl == "warning"]
+
+    def test_the_folder_is_not_made_before_mo2_creates_the_mod(self):
+        """MO2's createMod asks Merge / Replace / Rename (and sets the old folder aside) if the folder exists."""
+        seen = []
+        real = self.org.createMod
+
+        def create(guessed):
+            seen.append((self.mods / guessed.value).exists())
+            return real(guessed)
+
+        self.org.createMod = create
+        self.start()
+        self.assertEqual(seen, [False, False])
+        self.assertTrue((self.mods / self.SUPPORT).is_dir())                    # made afterwards for the plugin to fill
+
+    def test_a_folder_on_disk_that_mo2_has_not_listed_is_adopted_not_recreated(self):
+        for name in (self.SUPPORT, self.SETTINGS):
+            (self.mods / name).mkdir()
+        self.org.on_disk_after_refresh = [self.SUPPORT, self.SETTINGS]
+        self.start()
+        self.assertEqual(self.org.created, [])                                  # no "Mod Exists" prompt, no _backup folder
+        self.assertEqual(self.org.refreshed, [False])                           # one refresh lists them all
+        self.assertTrue(self.mod_list.state(self.SUPPORT) & fakes.sys.modules["mobase"].ModState.ACTIVE)
+        self.assertEqual(self.mod_list.names[0], self.SUPPORT)
+        self.assertEqual(sorted(p.name for p in self.mods.iterdir()), sorted([self.SUPPORT, self.SETTINGS]))
+
+    def test_a_folder_that_mo2_still_does_not_list_is_reported_once_not_prompted_about(self):
+        (self.mods / self.SUPPORT).mkdir()
+        self.start()
+        self.org.profile_callbacks[0](None, None)
+        self.assertEqual(self.org.created, [self.SETTINGS])
+        self.assertEqual(len([m for m in self.warnings() if self.SUPPORT in m and "does not list it" in m]), 2)
+
+    def test_repeated_events_do_not_pile_up_refreshes_while_one_is_pending(self):
+        (self.mods / self.SUPPORT).mkdir()
+        fakes.QTimer.queue = []
+        self.addCleanup(setattr, fakes.QTimer, "queue", None)
+        self.start()
+        self.org.profile_callbacks[0](None, None)
+        self.assertEqual(len(fakes.QTimer.queue), 1)
+        self.assertEqual(self.org.refreshed, [])                                # not from inside the callback
+        fakes.QTimer.run_queued()
+        self.assertEqual(self.org.refreshed, [False])
+
+    def test_both_pinned_mods_are_created_enabled_and_placed_at_their_ends(self):
+        self.start()
+        self.assertEqual(self.org.created, [self.SETTINGS, self.SUPPORT])
+        self.assertEqual(self.mod_list.names, [self.SUPPORT, "alpha", "beta", self.SETTINGS])
+        self.assertTrue(self.mod_list.state(self.SUPPORT) & fakes.sys.modules["mobase"].ModState.ACTIVE)
+        self.assertTrue((self.mods / self.SUPPORT).is_dir())                     # its folder exists for the plugin to fill
+
+    def test_an_existing_support_mod_is_not_recreated_and_is_moved_to_the_start(self):
+        self.mod_list.names[:] = ["alpha", self.SUPPORT, "beta"]
+        self.mod_list.active.add(self.SUPPORT)
+        self.start()
+        self.assertNotIn(self.SUPPORT, self.org.created)
+        self.assertEqual(self.mod_list.names[0], self.SUPPORT)
+
+    def test_another_mod_cannot_be_placed_above_it(self):
+        self.start()
+        fakes.LOG.clear()
+        self.mod_list.user_move("alpha", 0)
+        self.assertEqual(self.mod_list.names[0], self.SUPPORT)
+        (warning,) = self.warnings()
+        self.assertIn("'alpha' cannot be placed above 'SDK Mod Support'", warning)
+        self.assertIn("first, at the lowest priority", warning)
+        self.assertIn("every other mod can override its files", warning)
+
+    def test_it_cannot_be_moved(self):
+        self.start()
+        fakes.LOG.clear()
+        self.mod_list.user_move(self.SUPPORT, 2)
+        self.assertEqual(self.mod_list.names[0], self.SUPPORT)
+        (warning,) = self.warnings()
+        self.assertIn("'SDK Mod Support' cannot be moved", warning)
+
+    def test_it_cannot_be_deactivated(self):
+        self.start()
+        fakes.LOG.clear()
+        self.mod_list.user_set_active(self.SUPPORT, False)
+        self.assertTrue(self.mod_list.state(self.SUPPORT))
+        (warning,) = self.warnings()
+        self.assertIn("'SDK Mod Support' cannot be deactivated. It holds the SDK's files", warning)
+
+    def test_the_two_pinned_mods_do_not_fight(self):
+        self.start()
+        for name, where in (("alpha", 0), ("beta", 99), (self.SETTINGS, 0), (self.SUPPORT, 99), ("alpha", 0)):
+            self.mod_list.user_move(name, where)
+            self.assertEqual((self.mod_list.names[0], self.mod_list.names[-1]), (self.SUPPORT, self.SETTINGS), (name, where))
+        self.assertEqual(sorted(self.mod_list.names), sorted(["alpha", "beta", self.SUPPORT, self.SETTINGS]))
+
+    def test_a_new_install_is_kept_clear_of_both_ends(self):
+        self.start()
+        fakes.LOG.clear()
+        self.mod_list.names.append("new mod")                                    # MO2 adds new mods at the end
+        self.org.installed_callbacks[0](fakes.FakeMod(self.mods, name="new mod"))
+        self.assertEqual((self.mod_list.names[0], self.mod_list.names[-1]), (self.SUPPORT, self.SETTINGS))
+        self.assertIn("'SDK Mod Settings' was kept last, directly before Overwrite, after installing 'new mod'",
+                      "\n".join(m for _, m in fakes.LOG))
+
+    def test_a_game_without_an_sdk_has_no_support_mod(self):
+        org = fakes.FakeOrganizer()
+        org.mods_path, org.base_path = str(self.mods), str(self.instance)
+        game = BorderlandsGame(dataclasses.replace(BORDERLANDS_4, sdk=None))
+        game.init(org)
+        game.setGamePath(self.game_dir)
+        org.managed = game
+        org.ui_callbacks[0](None)
+        self.assertEqual(org.created, [self.SETTINGS])
+
+    def test_the_support_mod_is_set_up_when_the_profile_changes(self):
+        self.org.profile_callbacks[0]("old", "new")
+        self.assertIn(self.SUPPORT, self.org.created)
+
+
 class Checker(unittest.TestCase):
     def test_check_results_map_to_mobase_constants(self):
         checker = BorderlandsModDataChecker(BORDERLANDS_4, lambda: "")
@@ -476,6 +668,22 @@ class Checker(unittest.TestCase):
         tree = FakeTree(FakeEntry("x.pak"))
         BorderlandsModDataChecker(BORDERLANDS_3, lambda: "~mods").fix(tree)
         self.assertEqual(tree.moves, [("x.pak", "OakGame/Content/Paks/~mods/")])
+
+
+class SdkSwitchOff(unittest.TestCase):
+    """With the tools plugin's ``sdk_support`` setting turned off the SDK mod is not pinned (on is the default)."""
+
+    def test_the_support_mod_is_pinned_by_default_and_not_when_the_setting_is_off(self):
+        game = BorderlandsGame(BORDERLANDS_4)
+        org = fakes.FakeOrganizer()
+        game.init(org)
+        self.assertIn("SDK Mod Support", [pin.name for pin in game._pins()])      # setting never written: the default
+        org.settings[("Borderlands Tools", "sdk_support")] = "false"
+        names = [pin.name for pin in game._pins()]
+        self.assertNotIn("SDK Mod Support", names)
+        self.assertIn("SDK Mod Settings", names)                                  # the redirect mod never depends on it
+        org.settings[("Borderlands Tools", "sdk_support")] = True
+        self.assertIn("SDK Mod Support", [pin.name for pin in game._pins()])
 
 
 if __name__ == "__main__":

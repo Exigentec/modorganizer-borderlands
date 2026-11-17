@@ -72,6 +72,42 @@ def safe_folder_name(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .") or "Tool"
 
 
+def docs_to_hide(spec: GameSpec, mod_dir: Path, hidden_suffix: str) -> list[Path]:
+    """Documentation a mod leaves in its root, which has no business in the game folder.
+
+    * loose top-level files named like documentation (``README.txt``, ``INSTALL``, ``CHANGELOG.txt``,
+      ``WHERE_TO_INSTALL.txt`` ...), and
+    * every file in a top-level folder that holds nothing but documentation and pictures (``docs``,
+      ``Screenshots``).
+
+    The game's own folders, tool folders and anything else are never looked into, and files that are
+    already hidden are skipped.
+    """
+    found: list[Path] = []
+    try:
+        entries = sorted(mod_dir.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        name = entry.name
+        if name.casefold() in _IGNORED or name.casefold().endswith(hidden_suffix.casefold()):
+            continue
+        if entry.is_symlink():
+            continue
+        if entry.is_file():
+            if layout.is_doc_name(name):
+                found.append(entry)
+        elif entry.is_dir() and name.casefold() not in spec.mod_dirs:
+            nodes = nodes_from_dir(entry)
+            if nodes is None:
+                continue
+            files = [p for p in entry.rglob("*") if p.is_file() and not p.is_symlink()
+                     and not p.name.casefold().endswith(hidden_suffix.casefold())]
+            if files and all(layout.is_doc(p.name) for p in files):
+                found.extend(files)
+    return found
+
+
 def relocate(spec: GameSpec, mod_dir: Path, pak_subdir: str, mod_name: str = "") -> list[Message]:
     """Place nested content and loose files of ``mod_dir`` where the game expects them.
 

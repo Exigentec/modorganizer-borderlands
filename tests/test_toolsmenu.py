@@ -357,7 +357,8 @@ class MenuEdges(Base):
         (kind, names), = self.plugin.requirements()
         self.assertEqual(names, frozenset(s.game_name for s in ALL_SPECS))
         self.assertEqual({s.key: s.default for s in self.plugin.settings()},
-                         {KEY_SETTING: "", DISMISS_SETTING: False, "tool_support_phaseloot": True})
+                         {KEY_SETTING: "", DISMISS_SETTING: False, "sdk_support": True, "sdk_update_check": True,
+                          "tool_support_phaseloot": True})
         self.assertEqual(self.plugin.displayName(), "Borderlands: Choose a tool...")
 
 
@@ -565,7 +566,9 @@ class ToolEntries(Base):
         self.menu.addAction(fakes.QAction("Borderlands: Choose a tool..."))
 
     def entries(self):
-        return [a.text() for a in self.menu.actions() if not a.separator]
+        """The tool entries (the SDK entries, which Borderlands 4 always has, are tested separately)."""
+        return [a.text() for a in self.menu.actions()
+                if not a.separator and not a.text().startswith("Borderlands SDK:")]
 
     def show(self):
         self.menu.show()
@@ -575,7 +578,7 @@ class ToolEntries(Base):
         return next(a for a in self.menu.actions() if a.text() == text)
 
     def test_the_window_is_searched_for_mo2s_tools_action(self):
-        self.window.findChild.assert_called_with(fakes.QAction, "actionTool")
+        self.window.findChild.assert_any_call(fakes.QAction, "actionTool")
 
     def test_each_program_gets_an_entry_after_mo2s_own(self):
         self.add_mod("Plain", {"OakGame/x.pak": "x"})
@@ -587,7 +590,6 @@ class ToolEntries(Base):
     def test_with_no_tools_the_menu_is_left_alone(self):
         self.add_mod("Plain", {"OakGame/x.pak": "x"})
         self.assertEqual(self.show(), ["Borderlands: Choose a tool..."])
-        self.assertFalse(any(a.separator for a in self.menu.actions()))
 
     def test_entries_follow_the_enabled_mods_and_never_pile_up(self):
         self.add_mod("PhaseLoot", {"Tools/PhaseLoot/PhaseLoot.exe": "x"})
