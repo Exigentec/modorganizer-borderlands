@@ -16,17 +16,26 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import QApplication, QInputDialog, QMessageBox
 
-from . import peinfo, tools, trust, tweaks, virustotal
+from . import peinfo, sdkcontent, tools, trust, tweaks, ui, virustotal
 from .nexus import NexusClient
+from .sdkmanager import SdkManager
+from .usvfsmanager import UsvfsManager
 from .spec import ALL_SPECS, GameSpec
 
 KEY_SETTING = "virustotal_api_key"
 DISMISS_SETTING = "virustotal_prompt_dismissed"
+SDK_UPDATE_SETTING = "sdk_update_check"
+SDK_SUPPORT_SETTING = "sdk_support"
 TITLE = "Borderlands tools"
 
 
 def _truthy(value) -> bool:
     return value is True or str(value).strip().casefold() in ("1", "true", "yes")
+
+
+def _on_by_default(value) -> bool:
+    """A setting that is on unless it was explicitly turned off (None: not readable, so the default)."""
+    return True if value is None else _truthy(value)
 
 
 def _nexus_text(v) -> str:
@@ -46,6 +55,9 @@ class BorderlandsTools(mobase.IPluginTool):
     def __init__(self):
         super().__init__()
         self._organizer: mobase.IOrganizer
+        self._sdk_mgr: SdkManager | None = None
+        self.diagnose = None  # the SDK notifications plugin, set by createPlugins
+        self._make_usvfs = self._default_usvfs  # replaced in tests
         self._parent = None
         self._nexus = NexusClient()
         self._vt: virustotal.VirusTotalClient | None = None
@@ -59,6 +71,13 @@ class BorderlandsTools(mobase.IPluginTool):
     def init(self, organizer: mobase.IOrganizer) -> bool:
         self._organizer = organizer
         organizer.onUserInterfaceInitialized(self._on_ui)
+        organizer.onAboutToRun(self._on_about_to_run)
+        organizer.onFinishedRun(self._on_finished_run)
+        organizer.onProfileChanged(lambda _old, _new: self._on_profile_changed())
+        mod_list = organizer.modList()
+        mod_list.onModInstalled(self._on_mod_installed)
+        mod_list.onModStateChanged(lambda states: self._notify_later())
+        mod_list.onModRemoved(lambda name: self._notify_later())
         return True
 
     def name(self) -> str:
@@ -91,6 +110,18 @@ class BorderlandsTools(mobase.IPluginTool):
                 DISMISS_SETTING,
                 "Do not ask about the VirusTotal API key at startup.",
                 False,
+            ),
+            mobase.PluginSetting(
+                SDK_SUPPORT_SETTING,
+                "Manage the Borderlands 4 SDK (set-up, files, notifications, its menu entries). Turn off to leave "
+                "the SDK alone; the usvfs upgrade and revert handling does not depend on it. Takes effect after "
+                "a restart.",
+                True,
+            ),
+            mobase.PluginSetting(
+                SDK_UPDATE_SETTING,
+                "Check for a newer Borderlands 4 SDK release at startup (one request to GitHub) and offer to update.",
+                True,
             ),
             *(mobase.PluginSetting(t.setting, t.description, True) for t in tweaks.TWEAKS),
         ]
@@ -137,6 +168,78 @@ class BorderlandsTools(mobase.IPluginTool):
         path = Path(self._organizer.basePath()) / "plugin_state" / "borderlands" / "approved_tools.json"
         return trust.ApprovalStore(path)
 
+    def _sdk_manager(self) -> SdkManager | None:
+        """The SDK manager for the managed game, or None if that game has no SDK."""
+        spec = self._spec()
+        if spec is None or spec.sdk is None:
+            return None
+        if self._sdk_mgr is None or self._sdk_mgr._spec is not spec:
+            def update_check() -> bool:
+                value = self._setting(SDK_UPDATE_SETTING)
+                return value is None or _truthy(value)
+
+            self._sdk_mgr = SdkManager(self._organizer, spec, self._active_mods, lambda: self._parent,
+                                       update_check=update_check, on_change=self._notify,
+                                       usvfs_manager=self._make_usvfs(),
+                                       sdk_active=lambda: _on_by_default(self._setting(SDK_SUPPORT_SETTING)))
+        return self._sdk_mgr
+
+    def _default_usvfs(self) -> UsvfsManager:
+        return UsvfsManager(self._organizer, lambda: self._parent, on_change=self._notify)
+
+    sdk_manager = _sdk_manager  # the notifications plugin reads the manager through this name
+
+    # -- notifications -------------------------------------------------------------
+
+    def _notify(self) -> None:
+        """Ask MO2 to ask again which SDK problems are active."""
+        if self.diagnose is not None:
+            self.diagnose.invalidate()
+
+    def _notify_later(self) -> None:
+        QTimer.singleShot(0, self._notify)
+
+    # -- launches: the real SDK files must be right the moment a program starts -------
+
+    def _on_about_to_run(self, app_path, *_rest) -> bool:
+        try:
+            mgr = self._sdk_manager()
+            if mgr is not None:
+                mgr.before_launch(app_path)
+        except Exception as err:
+            qWarning(f"Borderlands: could not check the SDK before a launch: {err}")
+        return True  # never block a launch
+
+    def _on_finished_run(self, app_path, _exit_code=0) -> None:
+        try:
+            mgr = self._sdk_manager()
+            if mgr is not None:
+                mgr.after_run(app_path)
+        except Exception as err:
+            qWarning(f"Borderlands: could not check the SDK after a launch: {err}")
+
+    def _on_profile_changed(self) -> None:
+        try:
+            mgr = self._sdk_manager()
+            if mgr is not None:
+                mgr.on_profile_changed()
+        except Exception as err:
+            qWarning(f"Borderlands: could not check the SDK after the profile changed: {err}")
+
+    def _on_mod_installed(self, mod) -> None:
+        name, path = mod.name(), Path(mod.absolutePath())  # read now: the object may not outlive the callback
+
+        def after() -> None:  # after the game plugin has placed the mod's files
+            try:
+                mgr = self._sdk_manager()
+                if mgr is not None:
+                    mgr.on_mod_installed(name, path)
+            except Exception as err:
+                qWarning(f"Borderlands: could not check '{name}' for SDK mods: {err}")
+            self._notify()
+
+        QTimer.singleShot(0, after)
+
     def _key(self) -> str:
         key = self._setting(KEY_SETTING)
         return key.strip() if isinstance(key, str) else ""
@@ -154,7 +257,27 @@ class BorderlandsTools(mobase.IPluginTool):
     def _on_ui(self, window) -> None:
         if self._spec() is not None:
             self._attach_menu(window)
+        # MO2 calls this from inside the main window's constructor.  Dialogs (and a restart) must wait for
+        # the real event loop, or MO2 is left half started: see ui.when_running.
+        ui.when_running(lambda: self._startup_checks(window), lambda: window)
+
+    def _startup_checks(self, window) -> None:
+        mgr = None
         try:
+            mgr = self._sdk_manager()
+            if mgr is not None:
+                mgr.startup()
+        except Exception as err:  # never let the SDK check break MO2's startup
+            qWarning(f"Borderlands: could not check the SDK at startup: {err}")
+        try:
+            if mgr is not None and mgr.active and not getattr(mgr.usvfs, "restarting", False):
+                marker = Path(self._organizer.basePath()) / "plugin_state" / "borderlands" / "ui_state.json"
+                sdkcontent.show_column_once(window, marker)
+        except Exception as err:
+            qWarning(f"Borderlands: could not show the Content column: {err}")
+        try:
+            if mgr is not None and getattr(mgr.usvfs, "restarting", False):
+                return  # MO2 is restarting: the key prompt can wait for the new session
             if self._spec() is None or self._key() or _truthy(self._setting(DISMISS_SETTING)):
                 return
             self._ask_for_key(window)
@@ -200,7 +323,9 @@ class BorderlandsTools(mobase.IPluginTool):
             if self._spec() is None:
                 return
             found = tools.discover(self._active_mods())
-            if not found:
+            mgr = self._sdk_manager()
+            sdk_entries = mgr.menu_entries() if mgr is not None else []
+            if not found and not sdk_entries:
                 return
             labels = peinfo.entry_names([(peinfo.display_name(t.real), t.mod) for t in found])
             self._menu_actions.append(menu.addSeparator())
@@ -208,6 +333,14 @@ class BorderlandsTools(mobase.IPluginTool):
                 entry = QAction("Borderlands: " + label.replace("&", "&&"), menu)
                 entry.setToolTip(f"{tool.rel}  ({tool.mod})")
                 entry.triggered.connect(lambda checked=False, t=tool: self._entry_triggered(t))
+                menu.addAction(entry)
+                self._menu_actions.append(entry)
+            if found and sdk_entries:  # the programs mods ship, then the plugin's own support entries
+                self._menu_actions.append(menu.addSeparator())
+            for label, tip, callback in sdk_entries:
+                entry = QAction(label, menu)
+                entry.setToolTip(tip)
+                entry.triggered.connect(lambda checked=False, cb=callback: QTimer.singleShot(0, cb))
                 menu.addAction(entry)
                 self._menu_actions.append(entry)
         except Exception as err:  # a broken entry list must never break MO2's menu
