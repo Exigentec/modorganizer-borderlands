@@ -20,6 +20,10 @@ five managed games:
   - BL3/BL4: `.pak`, `.utoc`, `.ucas` go to `OakGame/Content/Paks/<pak_subdir>`.
   - BL4: `.sdkmod` goes to `sdk_mods/`.
   - BL2/TPS/GOTY: `.upk` goes to `WillowGame/CookedPCConsole/` (`CookedPC/` for GOTY).
+- Borderlands 4: installs, verifies, auto-heals, updates and switches off the unreal SDK from its GitHub
+  release (in a pinned "SDK Mod Support" mod plus the real loader files), warns when SDK mods lack it,
+  marks SDK mods in the mod list, and keeps usvfs new enough for them (see "The Borderlands 4 SDK" and
+  "usvfs").
 - Accepts a top-level `Tools/` folder in every game (standalone helper programs shipped as mods,
   for example `Tools/PhaseLoot/PhaseLoot.exe`) and runs them from a Tools-menu entry after checking
   them (see "Running tools").
@@ -54,8 +58,19 @@ in MO2's install dialog. A mod that is already laid out correctly (`OakGame/...`
 A program wins over everything else in the same folder, so PhaseLoot (an exe plus a `.pak`
 template) is a tool, not a pak mod. Folders of different kinds side by side are each placed by
 their own rule. A folder holding only documentation or pictures (`.txt .md .pdf .rtf .png .jpg
-.jpeg .gif .bmp .webp`), or nothing, is left where it is instead of making the archive invalid; next
+.jpeg .gif .bmp .webp`, or a file named like documentation, with or without a `.txt .ini .md .rtf .pdf .htm .html .nfo .url`
+extension: `readme`, `read me first`, `install`, `installing`, `installation`, `instructions`, `setup`, `start`, `startup`,
+`where to install`, `changelog`, `changes`, `history`, `what's new`, `license`, `credits`, `notes`, `faq`, `about`, matched on the whole name,
+so `setup.exe` is still a program), or nothing, is left where it is instead of making the archive invalid; next
 to a game folder it is simply accepted. Only `.exe` programs are recognised (no scripts yet).
+
+Documentation can also be kept out of the game folder, if you turn it on (the game plugin's `hide_documentation`
+setting, **off** by default, because it changes the mod's files): after an install, files in the mod's root named like
+documentation (`INSTALL.txt`, `CHANGELOG.txt`, `README.md`, `WHERE_TO_INSTALL.txt`, ...) and every file in a top-level
+folder that holds only documentation and pictures (`docs`, `Screenshots`) are renamed to `<name>.mohidden`, MO2's own
+"hide" (the VFS skips that suffix). The mod keeps them, and the mod's Filetree tab can unhide them. Folders of the game,
+tool folders and files that are not named like documentation are never touched. It only applies to mods installed
+afterwards.
 
 How it works, because MO2's manual dialog is picky (checked against the
 `modorganizer-installer_manual` source): the dialog turns green only for `VALID` content and never
@@ -63,7 +78,9 @@ calls the plugin's `fix()`; it installs the files as they are. So for content th
 to place, it answers `VALID`, remembers the top-level names, and moves the files on disk right
 after the install, from MO2's "mod installed" callback (this is also when the mod name is known,
 for `Tools/<mod name>/`). It only moves files when the installed top level matches what the dialog
-last accepted. Loose files at the archive root keep the usual `FIXABLE` + `fix()` route. Side
+last accepted. MO2 judges a mod's layout (the "invalid" icon) before it calls that callback, so after
+moving files the plugin asks MO2 to refresh once, just after the callback returns; without it the
+mod would show as invalid until the next manual refresh. Loose files at the archive root keep the usual `FIXABLE` + `fix()` route. Side
 effect: an archive that is only wrappers around placeable content can be taken by the quick
 installer without showing the dialog.
 
@@ -156,12 +173,121 @@ finish, and that wait can stall until some unrelated action in MO2's window trig
 tweak switched off just starts. The tool must be set to build into its `Built PAK` folder; the
 output location is the tool's own setting, and a pak built anywhere else is left alone.
 
+### The Borderlands 4 SDK
+
+Most Borderlands 4 mods are SDK mods, which need the [unreal SDK](https://github.com/bl-sdk/oak2-mod-manager)
+(its loader and Python runtime). The plugin installs and maintains it.
+
+**How it is installed** (found by trying it in MO2 with usvfs 0.5.7.x): the loader and runtime under
+`OakGame/Binaries/` must be real files in the game folder. A fully virtual install did not load, and
+neither did a real `dsound.dll` alone; a real `OakGame\Binaries\Win64\*` did. Everything else, the SDK's own
+mods in `sdk_mods/`, can be virtual. So:
+
+* the **whole release archive** goes into a mod of its own, **SDK Mod Support**. It is handled like
+  "SDK Mod Settings" (kept enabled, and put back if moved or deactivated, with a log line), except it is
+  pinned at the **lowest** priority, so every other mod can override its files. The plugin owns its
+  contents: anything missing or changed is restored without asking;
+* the files under `OakGame/Binaries/` are **also copied as real files** into the game folder, and
+  removed from there when the SDK is switched off. Those are checked strictly: at startup, **before
+  MO2 starts any program**, after the game exits, and when the profile changes. Missing or changed
+  ones are put back (the plugin cannot while the game is running, since the files are locked, and
+  says so in the log). The check takes about a quarter of a second cold and nothing when warm, because
+  hashes are remembered per file size and time.
+* The SDK's own mod files are only in the mod. MO2 sees files restored there from its next refresh
+  (the plugin asks for one), so a file restored *during* a launch shows from the next launch.
+
+The file list and SHA-256 hashes are learned from a cached copy of the release archive
+(`<instance>/plugin_state/borderlands/sdk/oak2-sdk.zip`); no file name or folder is hard-coded.
+
+* **Tools menu** (Borderlands 4): **Borderlands SDK: Set up... / Enable / Disable** (the label follows the
+  state) and **Borderlands SDK: Check for updates**.
+  * *Set up / Enable* downloads the latest release if there is no cached copy (after asking), fills the
+    SDK mod, and writes the real files. Real files that differ from the release are listed and replaced
+    only if you agree (this one time; later checks restore them without asking).
+  * *Disable* removes the SDK's real files from the game folder, one by one, each only if its hash still
+    matches (a file you changed is kept and listed). The SDK mod stays, but without the loader in the
+    game folder the SDK does not start, so the game runs stock (for matchmaking, for example).
+    *Enable* puts the files back from the cached copy. The game must be closed; the plugin checks.
+* **Updates.** At startup, if the SDK is enabled, the plugin asks GitHub for the latest release (one
+  request, off the UI thread; switch it off with `sdk_update_check` in Settings > Plugins > Borderlands
+  Tools). A newer release is offered: **Update**, **Skip this version** or **Not now**. An update
+  downloads the new archive and checks it first (GitHub's published SHA-256, then the archive's own
+  structure), and only then removes the old version's files by hash from the game folder and from the
+  SDK mod, replaces the cached copy and installs the new files. Nothing is touched if the download fails.
+* **Notifications** (the same kind as "Overwrite contains files"), each with a one-click fix: SDK mods
+  are enabled but the SDK is not set up or is switched off; the SDK's files are missing or changed and
+  could not be put right; a newer release exists; usvfs is too old (see below). Installing an SDK mod
+  while the SDK is not going to load it also writes a warning to the log.
+* **SDK mod flag.** Mods that contain SDK mods get MO2's settings-button icon in the mod list's
+  **Content** column. That column is hidden by default: right-click the list's header to show it.
+  The SDK's own files (and the SDK Mod Support mod) are not counted as SDK mods.
+* **Safety.** An archive is refused if any entry is absolute, climbs out with `..`, has a drive letter
+  or backslash, repeats a name ignoring case, or would replace the game's own executable. Files are
+  written through a temporary name that is hashed before it replaces anything, only below the game folder
+  or the SDK mod, and only the files being installed. The download address must be on the project's GitHub
+  releases and https.
+
+### usvfs (MO2's virtual file system)
+
+SDK mods supplied through MO2 only work with **usvfs 0.5.7.1 or newer**. The SDK's embedded Python 3.14
+checks whether a file exists with `GetFileInformationByName` and believes a "not found" answer; usvfs
+before 0.5.7.1 does not redirect that call (checked in its source and in the binaries), so the loader
+lists your MO2 mods but then cannot find them. MO2 2.5.2 ships usvfs 0.5.6.1.
+
+* **At startup** (Borderlands 4) the plugin reads the version of the four `usvfs_*` files next to
+  `ModOrganizer.exe` and of the library MO2 has actually loaded. If it is current it logs
+  `MO2 is using usvfs <version>` at info level. If it is older it logs a warning and asks to upgrade
+  (**Upgrade usvfs / Not now / Don't ask again**), saying that it is unlikely but that upgrading the
+  library could change how MO2 handles other games, since usvfs is shared by every instance.
+* **Upgrading** first saves the four current files to `<MO2 folder>\usvfs_versions\usvfs_<version>.zip` (backups an earlier version of the plugin left loose next to `ModOrganizer.exe` are moved there at startup) (logged with the
+  new version and the backup path), downloads the official `ModOrganizer2/usvfs` release 0.5.7.2 (the
+  archive's SHA-256 and each binary's SHA-256 are pinned in the plugin), unpacks only those four files
+  with Windows' own `tar.exe` (always `System32\tar.exe`: the GNU `tar` that Git for Windows or Cygwin put first on
+  PATH cannot read 7z), and replaces the loose files. A loaded DLL cannot be overwritten but can
+  be renamed, so each old file is moved aside as `<name>.replaced` (deleted at the next start) and the
+  swap is rolled back if anything fails. Then it offers to **restart MO2**, by starting a helper that
+  waits for MO2 to exit and relaunches the same instance and profile. MO2 itself is closed the way the
+  window's X does it (so it still asks about downloads and running programs); if you cancel that, the
+  helper gives up after 90 seconds and nothing restarts.
+* **SDK mod and pak mod flags**: MO2's Flags column is fixed, so mods that hold SDK mods get an icon (MO2's settings glyph),
+  and mods that hold `.pak/.utoc/.ucas` files get MO2's open package box (a mod with both gets both; Borderlands 3 gets
+  only the pak icon), in the **Content** column, which MO2 hides by default. With the SDK functions on, the plugin un-hides that column once, finding it by its
+  header text (position 3 is only the fallback if no header reads "Content", as in a translated MO2);
+  (`plugin_state/borderlands/ui_state.json` records it); hide it again from the header's right-click menu and it stays hidden.
+* **Pinned mods are never created over an existing folder**: MO2's `createMod` asks Merge / Replace / Rename when
+  the folder exists, and Replace sets the old one aside as `<name>_backup`. The plugin creates a missing pinned
+  mod with `createMod` before making any folder, and if the folder is already on disk but MO2 has not listed it
+  it refreshes the mod list (once, in the real event loop) and pins the mod it then finds.
+* **Restart helper log**: the helper appends each step (waiting, MO2 exited, files removed, started or the
+  error) to `<instance>\plugin_state\borderlands\usvfs_restart.log`, and after MO2 has exited it deletes the
+  `usvfs_*.replaced` files an upgrade set aside (they cannot be deleted while MO2 still has the DLL loaded).
+* **Restart helper**: it is started with `CREATE_NO_WINDOW`, never `DETACHED_PROCESS` (with that, PowerShell
+  started and never ran its command, so MO2 closed and nothing reopened it), and the instance and profile
+  are passed as one quoted string, because `Start-Process -ArgumentList` would split `Borderlands 4` in two.
+* **SDK switch**: the plugin setting `sdk_support` (Tools plugin settings, default **on**) turns every SDK
+  function on or off: set-up offer, file healing, launch hooks, notifications, the SDK menu entries and the
+  pin of the `SDK Mod Support` mod. The usvfs handling does not depend on it. Restart MO2 after changing it.
+* **Start-up timing**: MO2 calls a plugin's start-up callback from inside the main window's constructor,
+  before its event loop runs. Every prompt, upgrade and restart therefore waits (`ui.when_running`) until
+  the real loop is running, the window is shown and no other dialog is open. Done earlier, a restart's quit
+  request is cleared by `exec()` and MO2 is left running with a wait cursor. After a restart has been
+  requested, the SDK and VirusTotal prompts are left for the new session.
+* **Tools menu**: **Borderlands usvfs: Upgrade to 0.5.7.2** (when the files are older), and for each
+  saved backup **Revert to <version> (from backup)** or **Upgrade to <version> (from backup)**. Switching
+  saves the current files first, so you can switch back.
+* A notification stays until usvfs is new enough and MO2 has been restarted to use it.
+
 ### Redirected folders ("SDK Mod Settings")
 
-For Borderlands 4, everything pyunrealsdk mods write under `sdk_mods/settings/` goes to a
-dedicated mod called **SDK Mod Settings** instead of MO2's global Overwrite. Each folder is one
-`Redirect` entry in `borderlands/spec.py`; add another (for example `sdk_mods/keybinds`) and it
-gets the same behaviour, with its own mod, with no other code changes.
+For Borderlands 4, everything pyunrealsdk mods write under `sdk_mods/settings/`, and everything the
+keybinds package writes under `sdk_mods/keybinds/`, goes to one dedicated mod called **SDK Mod Settings**
+(in `sdk_mods/settings` and `sdk_mods/keybinds` inside it) instead of MO2's global Overwrite. Each folder
+is one `Redirect` entry in `borderlands/spec.py`; add another and it gets the same behaviour with no
+other code changes. Give it the same `mod_name` to share the mod (and a different `manifest_key`, so each
+folder keeps its own record of what it held), or a new name for a mod of its own. The `keybinds` entry
+uses `seed_existing=False`: that folder also holds the keybinds package itself, which must not be copied.
+New files the game creates there land in the mod; the package's own files stay where the SDK's mod
+supplies them.
 
 - **Created and modified files** are written into the mod through a create-target mapping.
   Files that already exist in the real game folder are copied into the mod first (never
@@ -257,6 +383,14 @@ Assumed, please check:
   the Ultra Plus file, whose Nexus page names the Ultra+ Manager as its consumer. Other mods may
   use different keys; those files are simply left alone.
 - Epic/GOG installs are not detected (Steam only).
+- **SDK management**: the release lookup, download, install into the mod and the real folder, verify,
+  heal, switch off and on were run live against the real v0.3 release in throwaway folders; the loaded-DLL
+  rename the usvfs upgrade relies on was exercised on a real loaded DLL. The pinned mod, menu entries,
+  dialogs, notifications, the Content-column flag and the restart helper have only been run against
+  stand-ins for MO2's API. The notifications are a plugin of their own (the shape of MO2's bundled
+  checkers) so a problem there cannot stop the tools menu from loading.
+- **usvfs upgrade**: pinned to 0.5.7.2, the release you tested; pairing it with MO2 2.5.2 is untested by
+  the plugin. The 0.5.7.1 threshold comes from usvfs's history (the hook was added in that release).
 - **Tool checks**: the Nexus endpoints and the VirusTotal lookup were exercised live, but the menu,
   the dialogs and the install-time file moves have only been run against stand-ins for MO2's API.
   Nexus's meaning of `QUARANTINED` (held for manual review) is the user's description, not
